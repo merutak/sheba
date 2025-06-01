@@ -1,0 +1,21 @@
+[project]
+name = "sheba"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Amichai Schreiber",email = "amichai@gloat.com"}
+]
+readme = "README.md"
+requires-python = ">=3.13,<4.0"
+dependencies = [
+    "pydantic-ai (>=0.1.8,<0.2.0)",
+    "pydantic-ai[logfire]",
+]
+
+[tool.poetry]
+packages = [{include = "sheba", from = "src"}]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
