@@ -64,7 +64,25 @@ The relevant time window for calendar is usually one week, unless specified othe
 In the context of Whatsapp, we would usually be dealing with 'favorite' contacts. Ignore chats where there was no interaction for 30 days or more.
 """
 
-scheduled_events = []
+# Initialize SQLite database
+db_path = "whatsapp_channels.db"
+conn = sqlite3.connect(db_path)
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS listened_channels (
+    chat_jid TEXT PRIMARY KEY,
+    last_polled_time TEXT
+)
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS scheduled_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    time TEXT NOT NULL
+)
+""")
+conn.commit()
 
 @agent.tool_plain
 async def schedule_event(title: str, prompt: str,
@@ -81,27 +99,15 @@ async def schedule_event(title: str, prompt: str,
     if absolute_target_time < datetime.datetime.now(datetime.timezone.utc):
         raise ValueError(f"Scheduled time must be in the future (got {absolute_target_time}).")
 
-    event = {
-        'title': title,
-        'prompt': prompt,
-        'time': absolute_target_time,
-    }
-    scheduled_events.append(event)
+    cursor.execute("""
+    INSERT INTO scheduled_events (title, prompt, time)
+    VALUES (?, ?, ?)
+    """, (title, prompt, absolute_target_time.isoformat()))
+    conn.commit()
+
     logger.info(f"Scheduled event: {title} at {absolute_target_time.isoformat()}")
     return f"Event '{title}' scheduled for {absolute_target_time.isoformat()}."
 
-
-# Initialize SQLite database
-db_path = "whatsapp_channels.db"
-conn = sqlite3.connect(db_path)
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS listened_channels (
-    chat_jid TEXT PRIMARY KEY,
-    last_polled_time TEXT
-)
-""")
-conn.commit()
 
 async def event_handler(stop_event):
     """
@@ -109,15 +115,24 @@ async def event_handler(stop_event):
     """
     while not stop_event.is_set():
         now = datetime.datetime.now(datetime.timezone.utc)
-        for event in scheduled_events[:]:
-            if event['time'] <= now:
-                try:
-                    logger.info(f"Executing scheduled event: {event['title']}")
-                    await agent.run(user_prompt=event['prompt'])
-                except Exception as e:
-                    logger.exception(f"Error executing scheduled event '{event['title']}': {e}")
-                finally:
-                    scheduled_events.remove(event)
+        cursor.execute("""
+        SELECT id, title, prompt, time FROM scheduled_events
+        WHERE time <= ?
+        """, (now.isoformat(),))
+        events = cursor.fetchall()
+
+        for event_id, title, prompt, time in events:
+            try:
+                logger.info(f"Executing scheduled event: {title}")
+                await agent.run(user_prompt=prompt)
+            except Exception as e:
+                logger.exception(f"Error executing scheduled event '{title}': {e}")
+            finally:
+                cursor.execute("""
+                DELETE FROM scheduled_events WHERE id = ?
+                """, (event_id,))
+                conn.commit()
+
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=1)  # Check every second or exit if stop_event is set
         except asyncio.TimeoutError:
