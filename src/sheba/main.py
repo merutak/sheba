@@ -10,6 +10,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 import asyncio
 import signal
+import sqlite3
 
 logfire.configure()
 logfire.instrument_pydantic_ai()
@@ -44,21 +45,63 @@ calendar = MCPServerStdio(
     args=[os.path.join(MCP_BASEDIR, 'google-calendar-mcp', 'build', 'index.js')],
 )
 
-now = datetime.datetime.now(datetime.timezone.utc)
 agent = Agent('openai:gpt-4o-mini', mcp_servers=[
     run_python,
     #code_indexer,
     whatsapp,
     calendar,
-    ],
-    system_prompt=f"""You're a development manager in Gloat, an Israeli-American B2B SaaS that provides HR software. You're also father of 3. It is now {now}.
+    ])
+
+@agent.system_prompt
+def system_prompt() -> str:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return f"""You're a development manager in Gloat, an Israeli-American B2B SaaS that provides HR software.
+You're also father of 3. It is now {now} (but you're in Israel).
+
 In the context of calendars, the interesting ones are Schreiber Kids (vs498pi8l2b3mjc019qprhv3ds@group.calendar.google.com), amichai@gloat.com and merutak@gmail.com (note that you'll need the calendar IDs, you don't access the Google API by calendar name). Avoid the 'list availability' tool, it appears broken. Don't read from other calendars.
 The relevant time window for calendar is usually one week, unless specified otherwise.
 
 In the context of Whatsapp, we would usually be dealing with 'favorite' contacts. Ignore chats where there was no interaction for 30 days or more.
-""")
+"""
 
 scheduled_events = []
+
+@agent.tool_plain
+async def schedule_event(title: str, prompt: str,
+                         absolute_target_time: None | datetime.datetime = None,
+                         time_from_now: None | datetime.timedelta = None):
+    """
+    Schedule an event to be executed at a specific time. Either absolute time or a relative time from now must be provided.
+    """
+    if absolute_target_time is None:
+        if time_from_now is None:
+            raise ValueError("Either absolute_target_time or time_from_now must be provided.")
+        absolute_target_time = datetime.datetime.now(datetime.timezone.utc) + time_from_now
+
+    if absolute_target_time < datetime.datetime.now(datetime.timezone.utc):
+        raise ValueError(f"Scheduled time must be in the future (got {absolute_target_time}).")
+
+    event = {
+        'title': title,
+        'prompt': prompt,
+        'time': absolute_target_time,
+    }
+    scheduled_events.append(event)
+    logger.info(f"Scheduled event: {title} at {absolute_target_time.isoformat()}")
+    return f"Event '{title}' scheduled for {absolute_target_time.isoformat()}."
+
+
+# Initialize SQLite database
+db_path = "whatsapp_channels.db"
+conn = sqlite3.connect(db_path)
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS listened_channels (
+    chat_jid TEXT PRIMARY KEY,
+    last_polled_time TEXT
+)
+""")
+conn.commit()
 
 async def event_handler(stop_event):
     """
@@ -97,61 +140,129 @@ async def main(prompt):
         await asyncio.gather(
             agent_loop(prompt, stop_event),
             poll_whatsapp(stop_event),
+            check_summons(agent, stop_event),
             event_handler(stop_event)
         )
 
 
-async def poll_whatsapp(stop_event):
-    last_msgs_by_jid = {
-        '120363401168037667@g.us': None,  # משחקים בקקה
-    }
+async def check_summons(agent, stop_event, interval_minutes=1):
+    """
+    Periodically checks all channels for invitation messages and updates the listened channels list.
+    """
     while not stop_event.is_set():
-        # this implementation iterates on the monitored chats. Another approach is to iterate on all recent chats.
-        got_any_messages = False
+        now = datetime.datetime.now(datetime.timezone.utc)
+        since_time = (now - datetime.timedelta(minutes=interval_minutes)).isoformat()
+
+        # Fetch all recent messages from all channels
+        all_messages = await whatsapp.call_tool('list_messages', {
+            'after': since_time,
+            'include_context': False,
+        })
+
+        for message_line in all_messages.splitlines():
+            try:
+                # Parse the message line using a more robust approach
+                timestamp_end = message_line.find("]") + 1
+                timestamp = message_line[1:timestamp_end - 1]  # Extract timestamp
+                rest = message_line[timestamp_end:].strip()
+
+                chat_start = rest.find("Chat: ") + len("Chat: ")
+                chat_end = rest.find(" From: ")
+                chat_name = rest[chat_start:chat_end].strip()
+
+                from_start = chat_end + len(" From: ")
+                from_end = rest.find(":", from_start)
+                contact_id = rest[from_start:from_end].strip()  # Extract contact ID
+
+                text = rest[from_end + 1:].strip()  # Extract the message content
+            except Exception as e:
+                logger.exception(f"Failed to parse message line: {message_line}")
+                continue
+
+            if "come in" in text.lower() or "אנא היכנס" in text:
+                # Check if the channel is already being listened to
+                cursor.execute("""
+                SELECT 1 FROM listened_channels WHERE chat_jid = ?
+                """, (chat_name,))
+                if cursor.fetchone():
+                    logger.info(f"Already listening to channel: {chat_name}, skipping invitation.")
+                    continue
+
+                # Use chat_name instead of chat_jid
+                cursor.execute("""
+                INSERT OR IGNORE INTO listened_channels (chat_jid, last_polled_time)
+                VALUES (?, ?)
+                """, (chat_name, now.isoformat()))
+                conn.commit()
+
+                # Fetch some history for context
+                history = await whatsapp.call_tool('list_messages', {
+                    'chat_jid': chat_name,
+                    'after': (now - datetime.timedelta(minutes=10)).isoformat(),
+                    'include_context': False,
+                })
+
+                # Respond to the invitation
+                prompt = f"""Here's a whatsapp conversation from this chat (Chat Name {chat_name}):
+<<HISTORY STARTS>>
+{history}
+<<HISTORY ENDS>>
+
+Send a message to this chat (and it alone) saying "thanks for inviting me".
+Use the channel's language, and if possible personalize the message a bit based on the previous messages.
+Prefix your message with ### to clarify that you're a bot.
+"""
+                await agent.run(user_prompt=prompt)
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_minutes * 60)
+        except asyncio.TimeoutError:
+            pass  # Timeout elapsed, continue the loop
+
+    print("Summons checker stopped.")
+
+
+async def poll_whatsapp(stop_event):
+    while not stop_event.is_set():
         now = datetime.datetime.now(datetime.timezone.utc)
 
-        for jid, meta in last_msgs_by_jid.items():
+        # Fetch all listened channels from SQLite
+        cursor.execute("SELECT chat_jid, last_polled_time FROM listened_channels")
+        listened_channels = cursor.fetchall()
+
+        got_any_messages = False
+
+        for chat_jid, last_polled_time in listened_channels:
             filter_msgs = {
-                'chat_jid': jid,
+                'chat_jid': chat_jid,
+                'after': last_polled_time or (now - datetime.timedelta(minutes=10)).isoformat(),
             }
-            if meta is not None:
-                filter_msgs['after'] = meta['last_polled_time']
-            else:
-                # if we don't have a last polled time, we assume the chat is new and we want all messages
-                filter_msgs['after'] = (now - datetime.timedelta(minutes=10)).isoformat()
 
-            if meta is None:
-                meta = {}
+            last_messages = await whatsapp.call_tool('list_messages', {
+                **filter_msgs,
+                'include_context': False,
+                'limit': 1,
+            })
+            if last_messages == 'No messages to display.' or not last_messages:
+                #print(f"No messages in {chat_jid} since {last_polled_time or 'never'}")
+                continue
 
-            last_messages: str = await whatsapp.call_tool('list_messages',
-                                                          {'filter': filter_msgs,
-                                                           'include_context': False,
-                                                           'limit': 1,
-                                                           })
+            # Update last polled time in SQLite
+            cursor.execute("""
+            UPDATE listened_channels
+            SET last_polled_time = ?
+            WHERE chat_jid = ?
+            """, (now.isoformat(), chat_jid))
+            conn.commit()
 
-            try:
-                meta['last_polled_time'] = now
+            last_sent_message = await invoke_agent_for_chat(now, chat_jid)
+            if last_sent_message is None:
+                continue
 
-                if not last_messages:
-                    print(f"No messages in {jid} since {meta['last_polled_time'] if meta else 'never'}")
-                    continue
+            got_any_messages = got_any_messages or last_messages[:10]
 
-                last_sent_message = await invoke_agent_for_chat(now, jid)
-                if last_sent_message is None:
-                    continue
-
-                got_any_messages = True
-
-                meta['last_send_time'] = last_sent_message['sent_time']
-
-            finally:
-                last_msgs_by_jid[jid] = meta
-
-        if got_any_messages:
-            sleep_interval = 5
-        else:
-            sleep_interval = 30
-            print("No new messages in any monitored chats.")
+        sleep_interval = 5 if got_any_messages else 30
+        print("No new messages in any monitored chats." if not got_any_messages else f"Processed new messages ({last_messages}).")
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=sleep_interval)
