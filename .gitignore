@@ -1,0 +1,6 @@
+__pycache__
+node_modules
+patient-records
+*.db
+client_secret*
+.*_key
